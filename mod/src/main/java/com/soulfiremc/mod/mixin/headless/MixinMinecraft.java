@@ -22,6 +22,7 @@ import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
 import com.mojang.authlib.minecraft.UserApiService;
 import com.mojang.renderpearl.api.device.GpuDevice;
 import com.mojang.renderpearl.api.device.GpuSurface;
+import com.soulfiremc.server.bot.BotConnection;
 import com.soulfiremc.server.renderer.VulkanRenderer;
 import net.minecraft.SystemReport;
 import net.minecraft.client.Minecraft;
@@ -34,6 +35,7 @@ import org.spongepowered.asm.mixin.injection.Redirect;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
+import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
 
 @Mixin(Minecraft.class)
@@ -55,9 +57,29 @@ public class MixinMinecraft {
     var minecraft = (Minecraft) (Object) this;
     minecraft.deltaTracker.advanceRealTime(net.minecraft.util.Util.getMillis());
     // Camera tracking updates simulation state used by lighting and fog, without drawing a frame.
+    // Per-bot: each BotConnection owns its own GameRenderer/Camera/DeltaTracker copy,
+    // so this does NOT touch shared Vulkan device state.
     minecraft.gameRenderer.update(minecraft.getDeltaTracker());
-    com.soulfiremc.server.bot.BotConnection.currentOptional().ifPresent(bot ->
-      bot.povFrameTasks().drain(minecraft.getFramerateLimitTracker()::onInputReceived));
+
+    // The only remaining GPU touch in a headless tick is POV capture.
+    // Serialize ONLY this call, briefly, so a POV viewer attached to one bot
+    // cannot starve every other bot's tick. When no POV viewer is attached,
+    // drain() is a no-op and the tryLock is uncontended.
+    com.soulfiremc.server.bot.BotConnection.currentOptional().ifPresent(bot -> {
+      boolean locked = false;
+      try {
+        locked = VulkanRenderer.DEVICE_LOCK.tryLock(5, TimeUnit.MILLISECONDS);
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        return;
+      }
+      try {
+        bot.povFrameTasks().drain(minecraft.getFramerateLimitTracker()::onInputReceived);
+      } finally {
+        if (locked) VulkanRenderer.DEVICE_LOCK.unlock();
+      }
+    });
+
     // There is no screen to present in headless mode, and the actual rendering is already
     // cancelled in GameRenderer. Skip the whole surface acquire/present path.
     ci.cancel();
@@ -77,8 +99,33 @@ public class MixinMinecraft {
   private void closePresentationSurface(GpuSurface surface) {
     // No surface exists in headless mode.
   }
+
+  /**
+   * Device-lock serialization of runTick.
+   *
+   * OLD: held DEVICE_LOCK for the entire bot tick. With N bots at 20 Hz that
+   * funnels N*20 tick attempts/sec through a single lock shared with the real
+   * render client, producing multi-hundred-millisecond PreTick gaps as soon as
+   * more than a few bots are connected. This is NOT a packet/applyRemoteState
+   * problem — the tick loop itself is being serialized away from the bot.
+   *
+   * NEW: for headless bot ticks, do not take DEVICE_LOCK at all. The bot's
+   * runTick body (entity tick, network, packet processor, input handling) is
+   * pure CPU work against per-bot Minecraft/ClientLevel/Options copies that
+   * SoulFire deep-copies in BotConnection.createMinecraftCopy(). The only GPU
+   * touch on the bot tick path is POV capture, and that is now guarded with a
+   * short tryLock(5ms) inside renderFrameHook above. Real client render thread
+   * still keeps full serialization so the main window is unaffected.
+   */
   @WrapMethod(method = "runTick")
   private void serializeDeviceAccess(boolean advanceGameTime, Operation<Void> original) {
+    if (BotConnection.currentOptional().isPresent()) {
+      // Headless bot: renderFrame is fully cancelled before any Vulkan submission.
+      // Only POV drain touches the shared device, and it has its own lock.
+      original.call(advanceGameTime);
+      return;
+    }
+    // Real client: keep serialization around the render/hot-swap window.
     VulkanRenderer.DEVICE_LOCK.lock();
     try {
       original.call(advanceGameTime);

@@ -99,24 +99,6 @@ public class MixinMinecraft {
   private void closePresentationSurface(GpuSurface surface) {
     // No surface exists in headless mode.
   }
-
-  /**
-   * Device-lock serialization of runTick.
-   *
-   * OLD: held DEVICE_LOCK for the entire bot tick. With N bots at 20 Hz that
-   * funnels N*20 tick attempts/sec through a single lock shared with the real
-   * render client, producing multi-hundred-millisecond PreTick gaps as soon as
-   * more than a few bots are connected. This is NOT a packet/applyRemoteState
-   * problem — the tick loop itself is being serialized away from the bot.
-   *
-   * NEW: for headless bot ticks, do not take DEVICE_LOCK at all. The bot's
-   * runTick body (entity tick, network, packet processor, input handling) is
-   * pure CPU work against per-bot Minecraft/ClientLevel/Options copies that
-   * SoulFire deep-copies in BotConnection.createMinecraftCopy(). The only GPU
-   * touch on the bot tick path is POV capture, and that is now guarded with a
-   * short tryLock(5ms) inside renderFrameHook above. Real client render thread
-   * still keeps full serialization so the main window is unaffected.
-   */
   @WrapMethod(method = "runTick")
   private void serializeDeviceAccess(boolean advanceGameTime, Operation<Void> original) {
     if (BotConnection.currentOptional().isPresent()) {
